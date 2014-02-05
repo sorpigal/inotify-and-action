@@ -34,7 +34,7 @@ Effectively any external action:
 				and pass the process the created file name
 
 
-PATTERN is assumed to be a BRE. Multiple actions are accepted.
+PATTERN is assumed to be a BRE. Multiple actions are accepted (delimit with comma).
 EOF
 	exit
 }
@@ -191,7 +191,7 @@ handle_file () {
 
 
 if [[ -z "$dirs" ]] ; then
-	printf 'Usage: %s DIR\n' "${0##*/}"
+	usage
 	exit
 fi
 
