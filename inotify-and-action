@@ -1,0 +1,263 @@
+#!/bin/bash
+
+# inotify-and-action
+# monitor a dir for incoming files and then do things
+#  a trivial wrapper around inotifywait
+# author sorpigal@gmail.com
+# created spring 2013 
+
+prog="${0##*/}"
+
+usage () {
+	cat<<EOF
+Usage: $prog [OPTIONS]... DIR [DIR]...
+	--on	ACTIONS		event(s) for which actions fire. Valid choices 
+				are create, open, close, delete, isdir, access, modify
+				For simplicity the following equivalencies apply
+					attr is treated as access
+					close_write and close_nowrite are treated as close
+					delete and delete_self are treated as delete
+					moved_to is treated as create
+					moved_from is treated as delete
+				Any events not mentioned here are ignored.
+
+Built in actions:
+
+	--link	PATTERN		for created files matching pattern prompt for 
+				a location to which to hard link
+	--copy	PATTERN		for created files matching pattern prompt for 
+				a loction to which to copy
+
+Effectively any external action:
+
+	--exec	PATTERN PATH	for created files matching pattern exec path 
+				and pass the process the created file name
+
+
+PATTERN is assumed to be a BRE. Multiple actions are accepted.
+EOF
+	exit
+}
+
+warning () {
+	printf '%s: %s\n' "$prog" "$@" 1>&2
+}
+
+fatal () {
+	warning "$@"
+	exit
+}
+
+# todo: use a hash table instead?
+link_pattern=
+linkable=
+copy_pattern=
+copyable=
+
+exec=
+exec_pattern=
+exec_path=
+exec_cmd=()
+parse_exec=
+
+monitor=()
+
+
+load_option_on () {
+	# read CSV values of events to monitor
+	IFS=, read -r -a monitor <<<"$1"
+	return 1
+}
+load_option_link () {
+	link_pattern="$1"
+	linkable=1
+	return 1
+}
+load_option_copy () {
+	copy_pattern="$1"
+	copyable=1
+	return 1
+}
+load_option_exec () {
+	exec_pattern="$1"
+	exec_path="$2"
+	exec=1
+
+	if ! [[ -x  "$exec_path" ]] ; then
+		fatal 'Not executable'
+	fi
+
+	parse_exec=1
+
+	return 2
+}
+
+valid_switch () {
+	case "$1" in
+		on|link|copy|exec|help) return 0 ;;
+		*) return 1 ;;
+	esac
+	return 1
+}
+
+invalid_switch () {
+	printf '%s: bad option --%s\n' "$prog" "$1"
+	usage
+}
+
+dirs=()
+while [[ $# -ne 0 ]] ; do
+	if [[ $parse_exec = 1 ]] ; then
+		# find -exec style end-of-exec or terminate on next known option (just for convenience)
+
+		if valid_switch "${1#--}" ; then
+			parse_exec=0
+		elif [[ $1 = ';' ]] ; then
+			parse_exec=0
+			shift
+		else
+			exec_cmd+=("$1")
+			shift
+		fi
+		continue
+	fi
+
+	case "$1" in
+		--help)
+			usage
+		;;
+		--*)
+			skip=0
+			switch="${1#--}" ; shift ;
+			if valid_switch "$switch" ; then
+				load_option_"${switch}" "$@"
+				skip=$?	# abuse return code to obtain number of options handled
+			else
+				invalid_switch "$switch"
+			fi
+			while [[ $skip -gt 0 ]] ; do
+				shift
+				let skip-=1
+			done
+		;;
+		*)
+			dir="$1" ; shift ;
+			if ! [[ -d "$dir" ]] ; then
+				printf '%s: No such directory %s\n' "${0##*/}" "$dir"
+			else
+				dirs=("${dirs[@]}" "$dir")
+			fi
+		;;
+	esac
+done
+
+doable () {
+	# TODO: Use bash internal regex instead, for portability and efficiency
+	[[ -n "$1" ]] && grep -q "$2" <<<"${3##*/}"
+}
+
+linkable () {
+	doable "$linkable" "$link_pattern" "${1##*/}"
+}
+
+copyable () {
+	doable "$copyable" "$copy_pattern" "${1##*/}"
+}
+
+execable () {
+	doable "$exec" "$exec_pattern" "${1##*/}"
+}
+
+linkfile () {
+	# if a name was specified use it, otherwise we assume cancel
+	cd "${1%/*}"
+	if name="$(zenity --file-selection --title "Create link to ${1##*/}")" ; then
+		ln "$1" "$name"
+	fi
+	cd -
+}
+
+copyfile () {
+	# if a name was specified use it, otherwise we assume cancel
+	if name="$(zenity --file-selection --title "Copy ${1##*/} to...")" ; then
+		cp -f "$1" "$name"
+	fi
+}
+
+# arbitrarily executes something and passes the file
+handle_file () {
+	"$exec_path" "$1" "${exec_cmd[@]}"
+}
+
+
+if [[ -z "$dirs" ]] ; then
+	printf 'Usage: %s DIR\n' "${0##*/}"
+	exit
+fi
+
+if [[ "${#dirs[@]}" -eq 0 ]] ; then
+	printf '%s: No directories specified\n' "${0##*/}"
+	exit
+fi
+
+
+# translate user events in to real event names
+real_events=()
+while [[ "${#real_events[@]}" == 0 ]] ; do
+	for monitored_event in "${monitor[@]}" ; do
+		case "$monitored_event" in
+			create)
+				real_events=("${real_events[@]}" CREATE MOVED_TO)
+			;;
+			access)
+				real_events=("${real_events[@]}" ACCESS OPEN ATTRIB)
+			;;
+			close)
+				real_events=("${real_events[@]}" CLOSE_WRITE CLOSE_NOWRITE)
+			;;
+			delete)
+				real_events=("${real_events[@]}" DELETE DELETE_SELF MOVED_FROM)
+			;;
+			modify)
+				real_events=("${real_events[@]}" MODIFY)
+			;;
+			isdir)
+				real_events=("${real_events[@]}" ISDIR)
+			;;
+			*)
+				warning "Unknown event '$monitored_event'"
+			;;
+		esac
+	done
+	# when "on" not specified default to create
+	if [[ "${#real_events[@]}" == 0 ]] ; then
+		monitor=(create)
+		warning "No events given, assuming --on create"
+	fi
+
+done
+
+
+while true ; do
+	IFS=' ' read -r -d $'\n' eventblock file < <(inotifywait "${dirs[@]}" --format '%e %w%f' 2>/dev/null)
+	IFS=, read -r -d $'\n' -a events <<<"$eventblock"
+
+	for event in "${events[@]}" ; do
+		# check that the received event is in the $real_events list
+		if grep -q -F -f <(printf '%s\n' "${real_events[@]}") <<<"$event" ; then
+			if linkable "$file" ; then
+				linkfile "$file"
+			fi
+
+			if copyable "$file" ; then
+				copyfile "$file"
+			fi
+
+			if execable "$file" ; then
+				handle_file "$file"
+			fi
+
+			# TODO: Other actions?
+		fi
+	done
+done
